@@ -1,0 +1,16 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+tmp/
+Data/processed/simulation_inputs/rainfall_daily_by_grid.csv
+Simulation/Archive
+Simulation/Simulation_output
+Simulation/Simulation_sensitivity
+Simulation/message
+Data_Analysis/Output
+Data_Analysis/Sensitivity_Analysis
+
+# Local/private source data not intended for public release.
+Data_Analysis/Surveillance.xlsx

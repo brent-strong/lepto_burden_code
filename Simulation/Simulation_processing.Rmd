@@ -1,0 +1,808 @@
+---
+title: "Simulation_processing"
+output: pdf_document
+date: "2025-11-18"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(parallel)
+library(viridis)
+library(latex2exp)
+source(file.path(Sys.getenv("LEPTO_BURDEN_ROOT", "."), "R", "paths.R"))
+
+#######################################Convergence################################################
+
+file_list <- list.files(
+  simulation_path("Simulation_output"),
+  pattern = "*.rds",
+  full.names = TRUE
+)
+
+num_cores <- detectCores()
+set <- 1:length(file_list)
+```
+
+## Convergence
+
+```{r conv}
+# 2. Nested Extraction: File -> List of Models -> Rhats & Checks
+results_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract file-level parameters
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  job  <- as.numeric(str_extract(fname, "(?<=job_)\\d+"))
+  
+  # Read the list of lists
+  sim_list <- readRDS(x)
+  
+  # INNER LOOP: Iterate through every simulation model
+  map_dfr(sim_list, function(single_model) {
+    
+    # Robust check: ensure the model has rhats (skip if NULL/failed sim)
+    if (is.null(single_model) || is.null(single_model$rhat)) return(NULL)
+    
+    rhat_vals <- single_model$rhat
+    es_val <- single_model$es_2024
+    
+    # Check if ES is valid (not NA)
+    # We use isTRUE to safely handle cases where es_val might be NULL or logical(0)
+    es_is_valid <- (!is.na(es_val) & es_val<100000)
+    
+    tibble(
+      sdalpha0 = sdalpha0,
+      piP = piP,
+      job = job,
+      
+      # Definition: All Rhats < 1.1 AND es_2024 is not NA
+      converged_1_1 = all(rhat_vals < 1.1, na.rm = TRUE) & es_is_valid,
+      
+      # Definition: All Rhats < 1.01 AND es_2024 is not NA
+      converged_1_01 = all(rhat_vals < 1.01, na.rm = TRUE) & es_is_valid
+    )
+  })
+  
+}, mc.cores = num_cores)
+
+# 3. Combine and Summarize
+summary_df <- results_list %>%
+  bind_rows() %>%                           
+  group_by(sdalpha0,piP) %>%                    
+  summarise(
+    total_sims = n(),                       
+    percent_less_1_1 = sum(converged_1_1, na.rm = TRUE)/200 * 100,
+    percent_less_1_01 = sum(converged_1_01, na.rm = TRUE)/200 * 100,
+    .groups = "drop"
+  )
+
+
+ggplot(summary_df, aes(x = sdalpha0, y = percent_less_1_1, color = factor(piP), group = piP)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(
+    x = TeX("SD of normal prior for logit$(\\alpha_0)$"),
+    y = "Percent Converged (Rhat < 1.1)",
+    color = TeX("logit$^{-1}(\\alpha_0)$")
+  ) +
+  theme_minimal()
+
+```
+
+## Forecasting
+
+You can also embed plots, for example:
+
+```{r forecast, echo=FALSE}
+
+# --- 1. PARALLEL PROCESSING ---
+results_list <- mclapply(set, function(i) {
+  
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    
+    if (is.null(sim) || is.null(sim$rhat)) return(NULL)
+    if (any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    
+    tibble(
+      sdalpha0 = sdalpha0,
+      piP = piP,
+      es_2024 = sim$es_2024,
+      crps = sim$crps,
+      bias_2024 = sim$bias_2024,
+      rate_2024_cover = sim$rate_2024_cover
+    )
+  })
+  
+}, mc.cores = num_cores)
+
+# --- 2. AGGREGATION ---
+summary_df <- results_list %>%
+  bind_rows() %>%
+  group_by(sdalpha0, piP) %>%
+  summarise(
+    median_es = median(es_2024, na.rm = TRUE),
+    median_crps = median(crps, na.rm = TRUE),
+    mean_percent_bias = (exp(mean(bias_2024, na.rm = TRUE)) - 1) * 100,
+    mean_coverage = mean(rate_2024_cover, na.rm = TRUE),
+    n_converged = n(),
+    .groups = "drop"
+  )
+
+# --- 3. SPLIT DATA FOR CONTROLLED PLOTTING ---
+df_main <- summary_df %>%
+  pivot_longer(
+    cols = c(median_es, median_crps, mean_percent_bias),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric = recode(metric,
+    "median_es" = "Median ES",
+    "median_crps" = "Median CRPS",
+    "mean_percent_bias" = "Mean Percent Bias"
+  ))
+
+df_cov <- summary_df %>%
+  pivot_longer(
+    cols = mean_coverage,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric = "Mean Coverage")
+
+# Reference lines for specific facets
+ref_lines <- tibble(
+  metric = c("Mean Coverage", "Mean Percent Bias"),
+  yintercept = c(95, 0)
+)
+
+# --- 4. PLOT ---
+ggplot() +
+  # Main metrics
+  geom_line(
+    data = df_main,
+    aes(x = sdalpha0, y = value, color = factor(piP)),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = df_main,
+    aes(x = sdalpha0, y = value, color = factor(piP)),
+    size = 2
+  ) +
+  
+  # Coverage
+  geom_line(
+    data = df_cov,
+    aes(x = sdalpha0, y = value, color = factor(piP)),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = df_cov,
+    aes(x = sdalpha0, y = value, color = factor(piP)),
+    size = 2
+  ) +
+  
+  # Reference lines
+  geom_hline(
+    data = ref_lines,
+    aes(yintercept = yintercept),
+    linetype = "dotted",
+    color = "red",
+    linewidth = 1,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +  # 2x2 layout
+  
+  scale_x_continuous(breaks = c(0.5,1.0,1.5)) +
+  scale_color_viridis_d(name = TeX("logit$^{-1}(\\alpha_0)$")) +
+  
+  theme_classic() +
+  labs(
+    x = TeX("SD of normal prior for logit$(\\alpha_0)$"),
+    y = "Estimate Value"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+## Parameter evaluation by region
+
+```{r param_region}
+
+extracted_metrics_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract parameters
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    # --- EXCLUSIONS ---
+    if (is.null(sim)) return(NULL)
+    # 1. Convergence (Rhat > 1.1)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    # 2. ES Validity (NA)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    # 3. Dataframe existence
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    # --- EXTRACTION ---
+    sim$param_metrics %>%
+      dplyr::select(region, log_bias_rate, prob_bias, abs_err_rate, abs_err_prob, cover_rate, cover_prob) %>%
+      pivot_longer(cols = -region, names_to = "metric_type", values_to = "value") %>%
+      mutate(sdalpha0 = sdalpha0, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+# --- 2. AGGREGATION AND TRANSFORMATION ---
+
+final_summary_df <- extracted_metrics_list %>%
+  bind_rows() %>%
+  group_by(sdalpha0, piP, region, metric_type) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    # Transformations
+    transformed_value = case_when(
+      metric_type == "log_bias_rate" ~ (exp(avg_value) - 1) * 100,
+      metric_type %in% c("abs_err_rate", "abs_err_prob") ~ avg_value,
+      TRUE ~ avg_value
+    ),
+    # Clean labels
+    display_metric = case_when(
+      metric_type == "log_bias_rate" ~ "Percent Bias (Rate)",
+      metric_type == "prob_bias" ~ "Bias (Prob)",
+      metric_type == "abs_err_rate" ~ "MAE (Rate)",
+      metric_type == "abs_err_prob" ~ "MAE (Prob)",
+      metric_type == "cover_rate" ~ "Coverage (Rate)",
+      metric_type == "cover_prob" ~ "Coverage (Prob)",
+      TRUE ~ metric_type
+    )
+  )
+
+extracted_metrics_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract parameters
+  nh <- as.numeric(str_extract(fname, "(?<=nh_)\\d+"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    # --- EXCLUSIONS ---
+    if (is.null(sim)) return(NULL)
+    # 1. Convergence (Rhat > 1.1)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    # 2. ES Validity (NA)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    # 3. Dataframe existence
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    # --- EXTRACTION ---
+    sim$param_metrics %>%
+      dplyr::select(region, log_bias_rate, prob_bias, abs_err_rate, abs_err_prob, cover_rate, cover_prob) %>%
+      pivot_longer(cols = -region, names_to = "metric_type", values_to = "value") %>%
+      mutate(nh = nh, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+# --- 2. AGGREGATION AND TRANSFORMATION ---
+
+final_summary_df <- extracted_metrics_list %>%
+  bind_rows() %>%
+  group_by(nh, piP, region, metric_type) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    # Transformations
+    transformed_value = case_when(
+      metric_type == "log_bias_rate" ~ (exp(avg_value) - 1) * 100,
+      metric_type %in% c("abs_err_rate", "abs_err_prob") ~ avg_value,
+      TRUE ~ avg_value
+    ),
+    # Map nh to Number of Hospitals
+    n_hospitals = case_when(
+      nh == 0 ~ 4, nh == 1 ~ 7, nh == 2 ~ 14, nh == 3 ~ 21, TRUE ~ NA_real_
+    ),
+    # Clean labels
+    display_metric = case_when(
+      metric_type == "log_bias_rate" ~ "Percent Bias (Rate)",
+      metric_type == "prob_bias" ~ "Bias (Prob)",
+      metric_type == "abs_err_rate" ~ "MAE (Rate)",
+      metric_type == "abs_err_prob" ~ "MAE (Prob)",
+      metric_type == "cover_rate" ~ "Coverage (Rate)",
+      metric_type == "cover_prob" ~ "Coverage (Prob)",
+      TRUE ~ metric_type
+    )
+  )
+
+# --- 3. GENERATING SEPARATE PLOTS ---
+
+# Get list of unique metrics to loop over
+# ... (Assume Steps 1 & 2 from the previous code are already run) ...
+
+# --- 3. GENERATING SEPARATE PLOTS (2x2 Grid) ---
+
+# Get list of unique metrics to loop over
+unique_metrics <- unique(final_summary_df$display_metric)
+
+# Create a named list to store the plots
+all_plots <- list()
+
+for (metric_name in unique_metrics) {
+  
+  # Filter data for this specific metric
+  plot_data <- final_summary_df %>% 
+    filter(display_metric == metric_name)
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes(x = n_hospitals, y = transformed_value, color = region)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    # CHANGED: ncol = 2 creates the 2x2 grid for the 4 piP values
+    facet_wrap(~ factor(piP), ncol = 2, labeller = as_labeller(function(x) paste("Average capture probability:", x))) +
+    scale_x_continuous(breaks = c(4, 7, 14, 21)) +
+    scale_color_viridis_d(name = "Health Region") +
+    theme_classic() +
+    labs(
+      title = metric_name,
+      x = "Number of Hospitals",
+      y = "Value"
+    ) +
+    theme(
+      legend.position = "bottom",
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = 12),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 14)
+    )
+  
+  
+    # Save to list using the metric name
+    
+  all_plots[[metric_name]] <- p
+}
+
+```
+
+
+## Parameter evaluation rates averaged
+
+```{r param_avg_rate}
+
+# --- 2. AGGREGATION AND TRANSFORMATION (Averaging across Regions) ---
+
+# We assume 'extracted_metrics_list' exists from the previous step.
+# If not, run Step 1 from the previous code block first.
+
+extracted_metrics_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract parameters
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    # --- EXCLUSIONS ---
+    if (is.null(sim)) return(NULL)
+    # 1. Convergence (Rhat > 1.1)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    # 2. ES Validity (NA)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    # 3. Dataframe existence
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    # --- EXTRACTION ---
+    sim$param_metrics %>%
+      dplyr::select(region, log_bias_rate, prob_bias, abs_err_rate, abs_err_prob, cover_rate, cover_prob) %>%
+      pivot_longer(cols = -region, names_to = "metric_type", values_to = "value") %>%
+      mutate(sdalpha0 = sdalpha0, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+regional_summary_df <- extracted_metrics_list %>%
+  bind_rows() %>%
+  
+  # 1. Filter for only the RATE metrics of interest
+  filter(metric_type %in% c("log_bias_rate", "abs_err_rate", "cover_rate")) %>%
+  
+  # 2. Group ONLY by experimental params (sdalpha0, piP) and metric type.
+  # By OMITTING 'region', the summarise step averages across all 7 regions.
+  group_by(sdalpha0, piP, metric_type) %>%
+  summarise(
+    global_avg = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Transformations
+  mutate(
+    transformed_value = case_when(
+      metric_type == "log_bias_rate" ~ (exp(global_avg) - 1) * 100, # Percent Bias
+      metric_type == "abs_err_rate" ~ sqrt(global_avg),                 # RMSE
+      TRUE ~ global_avg                                             # Coverage stays as is
+    ),
+    
+    # Clean labels for the facets
+    display_metric = case_when(
+      metric_type == "log_bias_rate" ~ "Bias",
+      metric_type == "abs_err_rate" ~ "MAE",
+      metric_type == "cover_rate" ~ "Coverage"
+    )
+  )
+
+# --- 3. VISUALIZATION ---
+
+# Set order of facets for visual consistency
+regional_summary_df$display_metric <- factor(
+  regional_summary_df$display_metric, 
+  levels = c("Bias", "MAE", "Coverage")
+)
+
+ggplot(regional_summary_df, aes(x = sdalpha0, y = transformed_value, color = factor(piP))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  
+  # Facet by the 3 Metrics
+  facet_wrap(~ display_metric, scales = "free_y", ncol = 3) +
+  
+  # Axis and Color settings
+  scale_x_continuous(breaks = c(0.5,1,1.5)) +
+  scale_color_viridis_d(name = TeX("logit$^{-1}(\\alpha_0)$")) +
+  
+  theme_classic() +
+  labs(
+    x = "SD for alpha_0",
+    y = "Metric Value"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 0) # Ensure x-axis labels are flat
+  )
+
+```
+
+## Parameter evaluation probs averaged
+
+```{r param_avg_prob}
+
+library(tidyverse)
+library(viridis)
+
+# --- 2. AGGREGATION AND TRANSFORMATION (Averaging across Regions) ---
+
+# We assume 'extracted_metrics_list' exists from the previous step.
+
+extracted_metrics_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract parameters
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    # --- EXCLUSIONS ---
+    if (is.null(sim)) return(NULL)
+    # 1. Convergence (Rhat > 1.1)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    # 2. ES Validity (NA)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    # 3. Dataframe existence
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    # --- EXTRACTION ---
+    sim$param_metrics %>%
+      dplyr::select(region, log_bias_rate, prob_bias, abs_err_rate, abs_err_prob, cover_rate, cover_prob) %>%
+      pivot_longer(cols = -region, names_to = "metric_type", values_to = "value") %>%
+      mutate(sdalpha0 = sdalpha0, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+regional_prob_summary_df <- extracted_metrics_list %>%
+  bind_rows() %>%
+  
+  # 1. Filter for only the PROBABILITY metrics of interest
+  filter(metric_type %in% c("prob_bias", "abs_err_prob", "cover_prob")) %>%
+  
+  # 2. Group ONLY by experimental params (sdalpha0, piP) and metric type
+  group_by(sdalpha0, piP, metric_type) %>%
+  summarise(
+    global_avg = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Transformations
+  mutate(
+    transformed_value = case_when(
+      # Apply square root to averaged MSE to get RMSE
+      metric_type == "abs_err_prob" ~ sqrt(global_avg), 
+      TRUE ~ global_avg # Bias and Coverage stay as the direct mean
+    ),
+    
+    # Clean labels for the facets
+    display_metric = case_when(
+      metric_type == "prob_bias" ~ "Bias",
+      metric_type == "abs_err_prob" ~ "MAE",
+      metric_type == "cover_prob" ~ "Coverage"
+    )
+  )
+
+# --- 3. VISUALIZATION ---
+
+# Set order of facets for visual consistency
+regional_prob_summary_df$display_metric <- factor(
+  regional_prob_summary_df$display_metric, 
+  levels = c("Bias", "MAE", "Coverage")
+)
+
+ggplot(regional_prob_summary_df, aes(x = sdalpha0, y = transformed_value, color = factor(piP))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  
+  # Facet by the 3 Probability Metrics
+  facet_wrap(~ display_metric, scales = "free_y", ncol = 3) +
+  
+  # Axis and Color settings
+  scale_x_continuous(breaks = c(0.5,1,1.5)) +
+  scale_color_viridis_d(name = TeX("logit$^{-1}(\\alpha_0)$")) +
+  
+  theme_classic() +
+  labs(
+    x = TeX("SD of normal prior for logit$(\\alpha_0)$"),
+    y = "Metric Value"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+## Create plot showing results for each simulation
+
+```{r detail}
+library(tidyverse)
+library(parallel)
+library(ggh4x) 
+
+# --- 1. DATA EXTRACTION (Same as before) ---
+
+raw_data_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    if (is.null(sim)) return(NULL)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    sim$param_metrics %>%
+      dplyr::select(region, prob_bias, post_mean_prob, lb_prob, ub_prob) %>%
+      mutate(sdalpha0 = sdalpha0, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+# --- 2. DATA PROCESSING ---
+
+full_df <- raw_data_list %>%
+  bind_rows() %>%
+  mutate(region = str_sub(region, 1, 3)) %>% 
+  group_by(sdalpha0, piP, region) %>%
+  slice_sample(n = 100) %>%
+  mutate(simNumber = row_number()) %>%
+  ungroup() %>%
+  mutate(
+    implied_truth = post_mean_prob - prob_bias,
+    ymin_bias = lb_prob - implied_truth,
+    ymax_bias = ub_prob - implied_truth,
+    piP_label = paste0("Prob: ", piP)
+  )
+
+# --- 3. UPDATED PLOTTING FUNCTION ---
+
+create_forest_plot <- function(data, y_limits, y_breaks = waiver()) {
+  ggplot(data, aes(x = simNumber, y = prob_bias, ymin = ymin_bias, ymax = ymax_bias)) +
+    geom_hline(yintercept = 0, col = 'red', linetype = 2, linewidth = 0.8) +
+    geom_errorbar(width = 0, linewidth = 0.3, alpha = 0.6) + 
+    geom_point(size = 0.5) +
+    
+    # CHANGED: Removed scales = "free_y" to keep scales consistent
+    facet_nested(region ~ sdalpha0 + piP_label) +
+    
+    # CHANGED: Added explicit scale control with 'oob = scales::squish'
+    # oob = scales::squish forces points outside the limits to be plotted at the limit edge
+    # or simply allows the error bars to exist even if the bound is cut off. 
+    # If you prefer them to disappear completely, remove 'oob = scales::squish'.
+    scale_y_continuous(limits = y_limits, breaks = y_breaks) +
+    
+    labs(
+      x = 'Simulation Number', 
+      y = 'Bias (Probability Scale)', 
+      title = NULL
+    ) +
+    theme_bw() + 
+    theme(
+      strip.background = element_rect(fill = 'white'),
+      strip.text = element_text(size = 10, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 9),
+      plot.title = element_text(size = 14, hjust = 0.5),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank()
+    )
+}
+
+# --- 4. GENERATE THE TWO PLOTS WITH CUSTOM SCALES ---
+
+# Dataset 1: Low Probability (0.2, 0.4)
+df_low <- full_df %>% 
+  filter(piP %in% c(0.1, 0.25))
+
+# Low Plot: -0.25 to 0.5 (Breaks automatic unless specified)
+plot_low <- create_forest_plot(
+  df_low, 
+  y_limits = c(-0.25, 0.5)
+)
+
+# Dataset 2: High Probability (0.6, 0.8)
+df_high <- full_df %>% 
+  filter(piP %in% c(0.5, 0.75))
+
+# High Plot: -0.6 to 0.3 by 0.3
+plot_high <- create_forest_plot(
+  df_high, 
+  y_limits = c(-0.4, 0.4),
+  y_breaks = seq(-0.4, 0.4, by = 0.2)
+)
+
+# --- 5. VIEW PLOTS ---
+# print(plot_low)
+# print(plot_high)
+
+
+```
+
+## Forest plot for rates
+
+```{r detail}
+
+# --- 1. DATA EXTRACTION (Adapted for Rates) ---
+
+raw_data_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  sdalpha0 <- as.numeric(str_extract(fname, "(?<=sdalpha0_)\\d+(\\.\\d+)?"))
+  piP <- as.numeric(str_extract(fname, "(?<=piP_)\\d*\\.?\\d+"))
+  
+  sim_list <- readRDS(x)
+  
+  map_dfr(sim_list, function(sim) {
+    # --- EXCLUSIONS ---
+    if (is.null(sim)) return(NULL)
+    if (is.null(sim$rhat) || any(sim$rhat > 1.1, na.rm = TRUE)) return(NULL)
+    if (is.null(sim$es_2024) || is.na(sim$es_2024)) return(NULL)
+    if (is.null(sim$param_metrics) || !is.data.frame(sim$param_metrics)) return(NULL)
+    
+    # --- EXTRACTION (Using Rate Variables) ---
+    sim$param_metrics %>%
+      dplyr::select(
+        region, 
+        rate_bias,         # Changed from prob_bias
+        post_mean_rate,    # Changed from post_mean_prob
+        lb_mean_rate,      # Changed from lb_prob
+        ub_mean_rate       # Changed from ub_prob
+      ) %>%
+      mutate(sdalpha0 = sdalpha0, piP = piP)
+  })
+}, mc.cores = num_cores)
+
+# --- 2. DATA PROCESSING ---
+
+full_df <- raw_data_list %>%
+  bind_rows() %>%
+  # Truncate region names
+  mutate(region = str_sub(region, 1, 3)) %>% 
+  group_by(sdalpha0, piP, region) %>%
+  slice_sample(n = 100) %>%
+  mutate(simNumber = row_number()) %>%
+  ungroup() %>%
+  mutate(
+    # 1. Calculate the "True" value implicitly used in the simulation
+    # Logic: Bias = Estimate - Truth  =>  Truth = Estimate - Bias
+    implied_truth = post_mean_rate - rate_bias,
+    
+    # 2. Adjust Intervals to be on the Bias Scale (Relative to Zero)
+    ymin_bias = lb_mean_rate - implied_truth,
+    ymax_bias = ub_mean_rate - implied_truth,
+    
+    piP_label = paste0("Prob: ", piP)
+  )
+
+# --- 3. PLOTTING FUNCTION ---
+
+create_forest_plot <- function(data, y_limits = NULL, y_breaks = waiver()) {
+  ggplot(data, aes(x = simNumber, y = rate_bias, ymin = ymin_bias, ymax = ymax_bias)) +
+    geom_hline(yintercept = 0, col = 'red', linetype = 2, linewidth = 0.8) +
+    geom_errorbar(width = 0, linewidth = 0.3, alpha = 0.6) + 
+    geom_point(size = 0.5) +
+    
+    facet_nested(region ~ sdalpha0 + piP_label) +
+    
+    # scale_y_continuous will handle the limits. 
+    # If y_limits is NULL (the default), it autoscales.
+    scale_y_continuous(limits = y_limits, breaks = y_breaks, oob = scales::squish) +
+    
+    labs(
+      x = 'Simulation Number', 
+      y = 'Bias (Rate Scale)', 
+      title = NULL
+    ) +
+    theme_bw() + 
+    theme(
+      strip.background = element_rect(fill = 'white'),
+      strip.text = element_text(size = 10, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 9),
+      plot.title = element_text(size = 14, hjust = 0.5),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank()
+    )
+}
+
+# --- 4. GENERATE THE TWO PLOTS ---
+
+# Dataset 1: Low Probability (0.2, 0.4)
+df_low <- full_df %>% 
+  filter(piP %in% c(0.1, 0.25))
+
+# NOTE: I set limits to NULL to autoscale first. 
+# You can inspect the plot and then add e.g., y_limits = c(-10, 10)
+plot_low_rate <- create_forest_plot(
+  df_low, 
+  y_limits = c(-50,50) 
+)
+
+# Dataset 2: High Probability (0.6, 0.8)
+df_high <- full_df %>% 
+  filter(piP %in% c(0.5, 0.75))
+
+plot_high_rate <- create_forest_plot(
+  df_high, 
+  y_limits = c(-25,25)
+)
+
+# --- 5. VIEW PLOTS ---
+# print(plot_low_rate)
+# print(plot_high_rate)
+
+
+```

@@ -1,0 +1,206 @@
+---
+title: "Simulation_processing"
+output: pdf_document
+date: "2025-11-18"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(parallel)
+library(viridis)
+source(file.path(Sys.getenv("LEPTO_BURDEN_ROOT", "."), "R", "paths.R"))
+
+#######################################Convergence################################################
+
+file_list <- list.files(
+  simulation_path("Simulation_sensitivity"),
+  pattern = "*.rds",
+  full.names = TRUE
+)
+
+num_cores <- detectCores()
+set <- 1:length(file_list)
+```
+
+## Convergence
+
+```{r conv}
+# 2. Nested Extraction: File -> List of Models -> Rhats & Checks
+results_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract file-level parameters
+  nh <- as.numeric(str_extract(fname, "(?<=nh_)\\d+"))
+  sd <- as.numeric(str_extract(fname, "(?<=sens_spec_)\\d*\\.?\\d+"))
+  job  <- as.numeric(str_extract(fname, "(?<=job_)\\d+"))
+  
+  # Read the list of lists
+  sim_list <- readRDS(x)
+  
+  # INNER LOOP: Iterate through every simulation model
+  map_dfr(sim_list, function(single_model) {
+    
+    # Robust check: ensure the model has rhats (skip if NULL/failed sim)
+    if (is.null(single_model) || is.null(single_model$rhat)) return(NULL)
+    
+    rhat_vals <- single_model$rhat
+    es_val <- single_model$es_2024
+    
+    # Check if ES is valid (not NA)
+    # We use isTRUE to safely handle cases where es_val might be NULL or logical(0)
+    es_is_valid <- !is.na(es_val)
+    
+    tibble(
+      nh = nh,
+      sd = sd,
+      job = job,
+      
+      # Definition: All Rhats < 1.1 AND es_2024 is not NA
+      
+      converged_1_5 = all(rhat_vals < 1.5, na.rm = TRUE) & es_is_valid,
+      converged_1_1 = all(rhat_vals < 1.1, na.rm = TRUE) & es_is_valid,
+      
+      # Definition: All Rhats < 1.01 AND es_2024 is not NA
+      converged_1_01 = all(rhat_vals < 1.01, na.rm = TRUE) & es_is_valid,
+      es_2024 = single_model$es_2024,
+      crps = single_model$crps,
+      bias_2024 = single_model$bias_2024,
+      rate_cover_2024=single_model$rate_2024_cover
+    )
+  })
+  
+}, mc.cores = num_cores)
+
+# 3. Combine and Summarize
+summary_df <- results_list %>%
+  bind_rows() %>%                           
+  group_by(nh, sd) %>%                    
+  summarise(
+    total_sims = n(),
+    percent_less_1_5=mean(converged_1_5, na.rm = TRUE) * 100,
+    percent_less_1_1 = mean(converged_1_1, na.rm = TRUE) * 100,
+    percent_less_1_01 = mean(converged_1_01, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+```
+
+
+## Forecasting
+
+You can also embed plots, for example:
+
+```{r forecast, echo=FALSE}
+results_list <- mclapply(set, function(i) {
+  x <- file_list[i]
+  fname <- basename(x)
+  
+  # Extract parameters from filename
+  nh <- as.numeric(str_extract(fname, "(?<=nh_)\\d+"))
+  sd <- as.numeric(str_extract(fname, "(?<=sens_spec_)\\d*\\.?\\d+"))
+  
+  # Read the list of simulations
+  sim_list <- readRDS(x)
+  
+  # Iterate through simulations in this file
+  map_dfr(sim_list, function(sim) {
+    
+    
+    
+    # 3. If passed, extract metrics
+    tibble(
+      nh = nh,
+      sd = sd,
+      es_2024 = sim$es_2024,
+      crps = sim$crps,
+      bias_2024 = sim$bias_2024,
+      rate_cover_2024=sim$rate_2024_cover
+    )
+  })
+  
+}, mc.cores = num_cores)
+
+# --- 2. AGGREGATION AND TRANSFORMATION ---
+# (This part remains largely the same, but now calculates stats only on converged models)
+
+summary_df <- results_list %>%
+  bind_rows() %>%
+  # Calculate medians per group
+  group_by(nh, sd) %>%
+  summarise(
+    median_es = median(es_2024, na.rm = TRUE),
+    median_crps = median(crps, na.rm = TRUE),
+    mean_percent_bias = (exp(mean(bias_2024,na.rm=T))-1)*100,
+    mean_coverage=mean(rate_cover_2024,na.rm=T),
+    # Optional: You might want to track how many models survived the filter
+    n_converged = sum(!is.na(es_2024)), 
+    .groups = "drop"
+  ) %>%
+  # Map nh to the specific X-axis values requested
+  mutate(
+    nh_days = case_when(
+      nh == 0 ~ 4,
+      nh == 1 ~ 7,
+      nh == 2 ~ 14,
+      nh == 3 ~ 21,
+      TRUE ~ NA_real_
+    )
+  ) 
+
+# --- 3. VISUALIZATION ---
+
+long_df <- summary_df %>%
+  pivot_longer(
+    cols = c(median_es, median_crps, mean_percent_bias,mean_coverage),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric = recode(metric,
+                         "median_es" = "Median ES",
+                         "median_crps" = "Median CRPS",
+                         "mean_percent_bias" = "Mean Percent Bias",
+                         "mean_coverage" = "Mean Coverage"
+  ))
+
+# Create reference lines for specific metrics
+ref_lines <- tibble(
+  metric = c("Mean Coverage", "Mean Percent Bias"),
+  yintercept = c(95, 0)
+)
+
+# Reference lines for specific facets
+ref_lines <- tibble(
+  metric = c("Mean Coverage", "Mean Percent Bias"),
+  yintercept = c(95, 0)
+)
+
+ggplot(long_df, aes(x = nh_days, y = value, color = factor(sd))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(
+    data = ref_lines,
+    aes(yintercept = yintercept),
+    linetype = "dotted",
+    color = "red",
+    linewidth = 1,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  scale_x_continuous(breaks = c(4, 7, 14, 21)) + 
+  scale_color_viridis_d(
+    name = "SD",
+    labels = function(x) scales::comma(as.numeric(x))
+  ) +
+  theme_classic() +
+  labs(
+    x = "Number of Hospitals",
+    y = "Estimate Value"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+```
