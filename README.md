@@ -16,8 +16,6 @@ The repository contains the data setup scripts, simulation study code, and real-
 ├── Data_Analysis/                   # real-data analysis scripts and manuscript figures
 ├── Simulation/                      # simulation study scripts, helper functions, and processors
 ├── R/paths.R                        # repo-relative path helpers
-├── Background/                      # background papers and notes
-└── Archive/                         # older exploratory scripts retained for reference
 ```
 
 `Data/scripts/archive/` and `Data_Analysis/Archive/` are historical references and may retain older paths or notation. Use the non-archive scripts for the reproducible workflow.
@@ -61,7 +59,7 @@ Main R package dependencies include `tidyverse`, `nimble`, `coda`, `sf`, `terra`
    - `Simulation/Simulation_processing_sensitivity.Rmd` processes the added-hospitals/test-prior sensitivity outputs.
 
 4. **Main CRC sandbox**
-   - `Example_model_script.R` contains an example capture-recapture model-fitting using the same data inputs and manuscript-aligned notation.
+   - `Example_model_script.R` contains an example model-fitting using the same data inputs and manuscript-aligned notation.
 
 Generated output directories such as `Simulation/Simulation_output`, `Simulation/Simulation_sensitivity`, `Data_Analysis/Output`, and `Data_Analysis/Sensitivity_Analysis` are ignored by Git.
 
