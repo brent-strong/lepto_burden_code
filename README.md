@@ -61,7 +61,7 @@ Main R package dependencies include `tidyverse`, `nimble`, `coda`, `sf`, `terra`
    - `Simulation/Simulation_processing_sensitivity.Rmd` processes the added-hospitals/test-prior sensitivity outputs.
 
 4. **Main CRC sandbox**
-   - `Example_model_script.R` contains an example capture-recapture model-fitting sandbox using the same data inputs and manuscript-aligned notation.
+   - `Example_model_script.R` contains an example capture-recapture model-fitting using the same data inputs and manuscript-aligned notation.
 
 Generated output directories such as `Simulation/Simulation_output`, `Simulation/Simulation_sensitivity`, `Data_Analysis/Output`, and `Data_Analysis/Sensitivity_Analysis` are ignored by Git.
 
