@@ -27,6 +27,10 @@ find_repo_root <- function(start = getwd()) {
 
 LEPTO_ROOT <- find_repo_root()
 
+repo_root <- function() {
+  LEPTO_ROOT
+}
+
 repo_path <- function(...) {
   file.path(LEPTO_ROOT, ...)
 }

@@ -6,7 +6,7 @@ library(purrr)
 library(sf)
 
 source(file.path(Sys.getenv("LEPTO_BURDEN_ROOT", "."), "R", "paths.R"))
-source(file.path(repo_root(), "R", "surveillance_inputs.R"))
+source(repo_path("R", "surveillance_inputs.R"))
 
 setwd(analysis_path())
 example <- read_rds("example_inputs.rds")
